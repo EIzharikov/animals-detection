@@ -3,7 +3,8 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
-from animals_detect.constants import DATA_YAML_RELATIVE, PROJECT_NAME, RESULTS_PATH, get_device
+from animals_detect.constants import (DATA_YAML_RELATIVE, PROJECT_NAME,
+                                      RESULTS_PATH, get_device)
 
 
 def train(args):
@@ -13,7 +14,7 @@ def train(args):
     run_name = f"{RESULTS_PATH}/{Path(args.model).name}_epochs{args.epochs}_imgsize{args.imgsize}_batch{args.batch}_freeze{args.freeze}_{timestamp}"
 
     model.train(
-        data=DATA_YAML_RELATIVE,  # путь к data.yml для животных
+        data=DATA_YAML_RELATIVE,
         epochs=args.epochs,
         imgsz=args.imgsize,
         batch=args.batch,

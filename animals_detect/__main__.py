@@ -18,25 +18,6 @@ def main():
         "--freeze", type=int, default=0, help="Amount of freezed layers"
     )
 
-    # ====== INFER ======
-    infer_parser = subparsers.add_parser("infer", help="Run inference")
-    infer_parser.add_argument(
-        "--weights", required=True, help="Path to trained weights"
-    )
-    infer_parser.add_argument(
-        "--source", required=True, help="Image or folder to infer on"
-    )
-
-    # ====== EVALUATE ======
-    eval_parser = subparsers.add_parser("evaluate", help="Run evaluate")
-    eval_parser.add_argument(
-        "--weights-dir", type=Path, required=True, help="Path to trained weights"
-    )
-    eval_parser.add_argument(
-        "--output", type=Path, required=True, help="Path to save table"
-    )
-    eval_parser.add_argument("--imgsizez", type=int, default=640, help="Image size")
-
     args = parser.parse_args()
     if args.command == "train":
         train(args)

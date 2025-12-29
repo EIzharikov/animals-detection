@@ -1,83 +1,166 @@
-import yaml
-from pathlib import Path
+import argparse
 from collections import Counter
+from pathlib import Path
 
-import torch
+import numpy as np
+import pandas as pd
+import yaml
 from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
 from ultralytics import YOLO
-from animals_detect.constants import PROJECT_ROOT
 
-def load_dataset(data_yml):
-    with open(data_yml) as f:
-        data_cfg = yaml.safe_load(f)
-    classes = data_cfg["names"]
-    val_files = data_cfg.get("val", [])
-    if not val_files:
-        raise ValueError("Val split missing in YAML")
-    val_files = [PROJECT_ROOT / Path(p) for p in val_files]
-    return classes, val_files
 
-def compute_stats(classes, val_files):
-    stats = {cls: {"encounters": 0, "total": 0, "max_per_image": 0} for cls in classes}
-    for img_path in val_files:
-        ann_file = PROJECT_ROOT / "data/labels" / img_path.parent.name / (img_path.stem + ".txt")
-        img_counter = Counter()
-        if ann_file.exists():
-            with open(ann_file) as f:
+def load_yaml(path):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def resolve_names(names):
+    if isinstance(names, dict):
+        return {int(k): v for k, v in names.items()}
+    return {i: v for i, v in enumerate(names)}
+
+
+def collect_images(val_entry, data_root):
+    val_path = (data_root / val_entry).resolve()
+    print(val_path)
+    if val_path.is_dir():
+        exts = {".jpg", ".jpeg", ".png", ".bmp"}
+        return sorted(p for p in val_path.rglob("*") if p.suffix.lower() in exts)
+    if val_path.is_file():
+        with open(val_path) as f:
+            return [
+                (data_root.parent / line.strip()).resolve()
+                for line in f
+                if line.strip()
+            ]
+    raise ValueError("Invalid val path")
+
+
+def label_path_from_image(img_path):
+    parts = list(img_path.parts)
+    if "images" not in parts:
+        raise ValueError(f"Invalid YOLO image path: {img_path}")
+    idx = parts.index("images")
+    parts[idx] = "labels"
+    return Path(*parts).with_suffix(".txt")
+
+
+def compute_table(classes, images):
+    stats = {
+        name: {"encounters": 0, "total": 0, "max_per_image": 0}
+        for name in classes.values()
+    }
+    for img in images:
+        ann = label_path_from_image(img)
+        counter = Counter()
+        if ann.exists():
+            with open(ann) as f:
                 for line in f:
-                    parts = line.strip().split()
-                    if parts:
-                        cls_id = int(parts[0])
-                        img_counter[cls_id] += 1
-        for cls_id, cls_name in classes.items():
-            if img_counter.get(cls_id, 0) > 0:
-                stats[cls_name]["encounters"] += 1
-                stats[cls_name]["total"] += img_counter[cls_id]
-                stats[cls_name]["max_per_image"] = max(stats[cls_name]["max_per_image"], img_counter[cls_id])
+                    cid = int(line.split()[0])
+                    counter[cid] += 1
+        for cid, cname in classes.items():
+            n = counter.get(cid, 0)
+            if n > 0:
+                stats[cname]["encounters"] += 1
+                stats[cname]["total"] += n
+                stats[cname]["max_per_image"] = max(stats[cname]["max_per_image"], n)
     return stats
 
-def compute_roc_auc(model_path, classes, val_files):
-    model = YOLO(model_path)
-    y_true, y_score = [], []
-    for img_path in val_files:
-        ann_file = PROJECT_ROOT / "data/labels" / img_path.parent.name / (img_path.stem + ".txt")
-        gt_cls = set()
-        if ann_file.exists():
-            with open(ann_file) as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if parts:
-                        gt_cls.add(int(parts[0]))
-        pred = model.predict(source=str(img_path), imgsz=640, conf=0.001, verbose=False)[0]
-        scores = [0.0] * len(classes)
-        if pred.boxes:
-            for cls_id, conf in zip(pred.boxes.cls.tolist(), pred.boxes.conf.tolist()):
-                scores[int(cls_id)] = max(scores[int(cls_id)], conf)
-        y_true.append([1 if i in gt_cls else 0 for i in range(len(classes))])
-        y_score.append(scores)
-    y_true = torch.tensor(y_true).numpy()
-    y_score = torch.tensor(y_score).numpy()
-    roc_auc = {}
-    for i, cls_name in classes.items():
-        try:
-            roc_auc[cls_name] = roc_auc_score(y_true[:, i], y_score[:, i])
-        except ValueError:
-            roc_auc[cls_name] = None
-    return roc_auc
 
-def print_stats_table(stats, roc_auc):
-    print(f"{'Class':<20} {'Encounters':<10} {'Total':<10} {'Max per image':<15} {'ROC AUC':<10}")
-    for cls_name, s in stats.items():
-        auc = f"{roc_auc.get(cls_name, 'N/A'):.3f}" if roc_auc.get(cls_name) is not None else "N/A"
-        print(f"{cls_name:<20} {s['encounters']:<10} {s['total']:<10} {s['max_per_image']:<15} {auc:<10}")
+def compute_roc_auc(weights, classes, images):
+    model = YOLO(weights)
+    y_true = []
+    y_score = []
+
+    for img in tqdm(images):
+        ann = label_path_from_image(img)
+        gt = set()
+        if ann.exists():
+            with open(ann) as f:
+                for line in f:
+                    gt.add(int(line.split()[0]))
+
+        result = model.predict(
+            source=str(img),
+            imgsz=640,
+            conf=0.001,
+            device=model.device,
+            verbose=False,
+        )[0]
+
+        scores = np.zeros(len(classes), dtype=float)
+        if result.boxes is not None and len(result.boxes) > 0:
+            for c, s in zip(result.boxes.cls.tolist(), result.boxes.conf.tolist()):
+                c = int(c)
+                scores[c] = max(scores[c], s)
+
+        y_true.append([1 if i in gt else 0 for i in range(len(classes))])
+        y_score.append(scores)
+
+    y_true = np.array(y_true)
+    y_score = np.array(y_score)
+
+    auc = {}
+    for i, name in classes.items():
+        try:
+            auc[name] = roc_auc_score(y_true[:, i], y_score[:, i])
+        except ValueError:
+            auc[name] = None
+    return auc
+
+
+def print_table(stats, auc):
+    header = f"{'Class':<20} {'Encounters':<12} {'Total':<10} {'Max/Image':<12} {'ROC AUC':<8}"
+    print(header)
+    print("-" * len(header))
+    for cls, s in stats.items():
+        a = auc.get(cls)
+        a = f"{a:.3f}" if a is not None else "N/A"
+        print(
+            f"{cls:<20} "
+            f"{s['encounters']:<12} "
+            f"{s['total']:<10} "
+            f"{s['max_per_image']:<12} "
+            f"{a:<8}"
+        )
+
+
+def save_excel(stats, auc, output_path):
+    rows = []
+    for cls, s in stats.items():
+        rows.append(
+            {
+                "Species": cls,
+                "Encounters": s["encounters"],
+                "Total individuals": s["total"],
+                "Max individuals per encounter": s["max_per_image"],
+                "ROC AUC": auc.get(cls),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_excel(output_path, index=False)
+
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", required=True)
     parser.add_argument("--data", required=True)
+    parser.add_argument("--output", default="evaluation.xlsx")
     args = parser.parse_args()
-    classes, val_files = load_dataset(args.data)
-    stats = compute_stats(classes, val_files)
-    roc_auc = compute_roc_auc(args.weights, classes, val_files)
-    print_stats_table(stats, roc_auc)
+
+    data_yaml = Path(args.data).resolve()
+    data_root = data_yaml.parent
+
+    cfg = load_yaml(data_yaml)
+    classes = resolve_names(cfg["names"])
+    images = collect_images(cfg["val"], data_root)
+
+    stats = compute_table(classes, images)
+    auc = compute_roc_auc(args.weights, classes, images)
+
+    print_table(stats, auc)
+    save_excel(stats, auc, args.output)
+
+    print(f"\nSaved Excel table to: {Path(args.output).resolve()}")
